@@ -8,6 +8,8 @@ from torch import Tensor
 class ModelConfig:
     n_embd:int
     n_head:int
+    state_dim:int
+    act_dim:int
     n_layer:int
     dropout:float
     bias:bool
@@ -99,9 +101,9 @@ class GPT(nn.Module):
             b, t = x.size()
             device = x.device
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-            tok_emb = self.transformer.wte(x)
-            pos_emb = self.transformer.wpe(pos)
-            x = self.transformer.drop(tok_emb + pos_emb)
+            tok_emb = self.wte(x)
+            pos_emb = self.wpe(pos)
+            x = self.dropout(tok_emb + pos_emb)
 
         for block in self.blocks:
             x = block(x)
