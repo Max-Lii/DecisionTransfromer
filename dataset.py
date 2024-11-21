@@ -8,7 +8,8 @@ import torch
 class DataSetConfig:
     path:str
     sample_length:int
-class D4RLDataLoader():
+
+class D4RLDatasets():
     def __init__(self,config:DataSetConfig):
         if not os.path.exists(config.path):
             raise FileNotFoundError(f"Data set not exist in path:{config.path}")
@@ -51,10 +52,10 @@ class D4RLDataLoader():
             t.append(self.sample_length)
             pad_mask.append(np.concatenate([np.ones(self.sample_length - pad_length),np.zeros(pad_length)]))
 
-        #convert to tensor
-        r = torch.stack([torch.from_numpy(data) for data in r],dim=0)
-        s = torch.stack([torch.from_numpy(data) for data in s],dim=0)
-        a = torch.stack([torch.from_numpy(data) for data in a],dim=0)
-        pad_mask = torch.stack([torch.from_numpy(data) for data in pad_mask],dim=0)
+        #convert all r,s,a to tensor (B,T,C)
+        r = torch.stack([torch.from_numpy(data) for data in r],dim=0).unsqueeze(-1).float()
+        s = torch.stack([torch.from_numpy(data) for data in s],dim=0).float()
+        a = torch.stack([torch.from_numpy(data) for data in a],dim=0).float()
+        pad_mask = torch.stack([torch.from_numpy(data) for data in pad_mask],dim=0).float()
 
         return r,s,a,t,pad_mask
