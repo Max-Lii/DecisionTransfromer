@@ -13,3 +13,5 @@ __pycache__/
 #ignore environment files
 env/
 venv/
+#ignore dataset file
+/data/
