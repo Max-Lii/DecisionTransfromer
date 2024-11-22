@@ -12,6 +12,8 @@ class ModelConfig():
     n_embd:int
     n_head:int
     state_dim:int
+    state_mean:np.ndarray
+    state_std:np.ndarray
     act_dim:int
     n_layer:int
     dropout:float
@@ -97,8 +99,8 @@ class GPT(nn.Module):
         super().__init__()
         #optional for turning off the wpe and wte
         self.gpt_wpe_wte_off = config.gpt_wpe_wte_off
-        self.wpe = nn.Embedding(config.context_size, config.n_embd) if not config.gpt_wpe_wte_off else None
-        self.wte = nn.Embedding(config.vocab_size,   config.n_embd) if not config.gpt_wpe_wte_off else None
+        self.wpe = nn.Embedding(config.context_size, config.n_embd) if not config.gpt_wpe_wte_off else nn.Identity()
+        self.wte = nn.Embedding(config.vocab_size,   config.n_embd) if not config.gpt_wpe_wte_off else nn.Identity()
 
         self.blocks = nn.ModuleList([ TransformerBlock(config) for _ in range(config.n_layer) ])
         self.dropout = nn.Dropout(config.dropout)
@@ -127,6 +129,11 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         self.context_size = config.context_size
         self.state_dim = config.state_dim
         self.act_dim = config.act_dim
+
+        #normalization for state
+        self.register_buffer("states_mean",torch.from_numpy(config.state_mean).view(1,1,self.state_dim))
+        self.register_buffer("states_std",torch.from_numpy(config.state_std).view(1,1,self.state_dim))
+
         #embedding for position(time step), state, actions, returns-to-go
         self.pe = nn.Embedding(config.context_size,self.n_embd)
         self.se = nn.Linear(config.state_dim,self.n_embd,bias=config.dt_bias)
@@ -136,16 +143,19 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         #prediction head for action, state, return-to-go 
         self.pred_act = nn.Sequential(
             nn.Linear(self.n_embd,config.act_dim,bias=config.dt_bias),
-            nn.Tanh if config.action_tanh else nn.Identity(),
+            nn.Tanh() if config.action_tanh else nn.Identity(),
         )
         self.pred_state = nn.Linear(self.n_embd,config.state_dim,bias=config.dt_bias)
         self.pred_rtg= nn.Linear(self.n_embd,1,bias=config.dt_bias)
 
         self.gpt = GPT(config)
-    def forward(self,returns_to_go:Tensor, states:Tensor, actions:Tensor, time_steps, pad_mask:Tensor = None)->Tuple[Tensor,Tensor,Tensor]:
+    def forward(self,returns_to_go:Tensor, states:Tensor, actions:Tensor, time_steps, pad_mask = None)->Tuple[Tensor,Tensor,Tensor]:
         B,T = returns_to_go.shape[:2]
         device = states.device
 
+        #normalization for state
+        states = (states - self.states_mean) / self.states_std
+        
         #embedding for r,s,a,time
         rtg_emb = self.re(returns_to_go)
         state_emb = self.se(states)
@@ -153,12 +163,13 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
 
        
         #position embedding for time steps
-        assert len(time_steps) == B,f"The element numbers:{len(t)} in time steps array should meet the length of bath size:{B}"
+        assert len(time_steps) == B,f"The element numbers:{len(time_steps)} in time steps array should meet the length of bath size:{B}"
         pos =  torch.tensor(np.array([np.arange(t) for t in time_steps]),dtype=torch.int,device=device) #torch.arange(0, time_steps, dtype=torch.long, device=device) # shape (t)
         pos_emb = self.pe(pos)
 
         #adding position embedding through broadcasting mechanism for better efficiency
         B,T,C = rtg_emb.size()
+        
         traj = torch.stack((rtg_emb,state_emb,act_emb),dim=2) + pos_emb.unsqueeze(2) # (3,B,T,C) -> (B,T,3,C)
         traj = traj.view(B,3*T,C) # (B,3T,C): each time steps have 3 tokens
         # Notice: The official code do a layer norm here,
@@ -197,27 +208,29 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         return rtg_pred, state_pred, act_pred
     
     @torch.inference_mode()
-    def get_action(self,returns_to_go, states, actions, time_steps,max_length):
+    def get_action(self,returns_to_go, states, actions, time_steps,max_length=None):
         #turn input into batches-like input
         states = states.view(1, -1, self.state_dim)
         actions = actions.view(1, -1, self.act_dim)
         returns_to_go = returns_to_go.view(1, -1, 1)
-        time_steps = time_steps.view(1, -1)
         
         att_msk = None
         #TODO:if need max_length clip the context
-        if max_length is not None:
-            states = states[:,-self.max_length:]
-            actions = actions[:,-self.max_length:]
-            returns_to_go = returns_to_go[:,-self.max_length:]
-            time_steps = time_steps[:,-self.max_length:]
+        # if max_length is not None:
+        #     states = states[:,-self.max_length:]
+        #     actions = actions[:,-self.max_length:]
+        #     returns_to_go = returns_to_go[:,-self.max_length:]
+        #     time_steps = time_steps[:,-self.max_length:]
+        states = states[:,-self.context_size:]
+        actions = actions[:,-self.context_size:]
+        returns_to_go = returns_to_go[:,-self.context_size:]
+        time_steps[0] =  min(time_steps[0],self.context_size)
         
         rtg_pred, state_pred, act_pred = self.forward(
             states=states,
             actions=actions,
             returns_to_go=returns_to_go,
             time_steps=time_steps,
-            attn_mask=att_msk
         )
 
         return act_pred[0,-1]
