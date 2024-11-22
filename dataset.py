@@ -23,6 +23,8 @@ class D4RLDatasets():
         # so we sample according to time steps
         self.sample_probs = np.array(dataset["episode_steps"]) / float(dataset["total_steps"])
 
+        self.obs_mean = dataset["obs_mean"]
+        self.obs_std = dataset["obs_std"]
         self.s_dim = self.episodes[0]["observations"].shape[-1]
         self.a_dim = self.episodes[0]["actions"].shape[-1]
     def get_batch(self,batch_size:int):
