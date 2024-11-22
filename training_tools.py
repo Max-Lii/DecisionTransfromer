@@ -14,15 +14,17 @@ import model
 class TrainerConfig:
     max_train_steps:int
     eva_interval:int
-    log_interval:int
     decay_lr:bool
     warmup_steps:int
-    learning_rate:int
+    learning_rate:float
     lr_decay_steps:int
-    min_lr:int
+    min_lr:float
     batch_size:int
     discrete_action:bool
     game:str
+    num_eval_episode:int = 50
+    grad_clip_max_norm:float|None = None
+
 
 
 class Trainer():
@@ -30,17 +32,19 @@ class Trainer():
         This is the trainer for the Decision Transformer,
         For now only supporting Mujoco(hopper) game
     """
-    def __init__(self,model:Module,dataloader,config:TrainerConfig):
+    def __init__(self,model,dataloader,config:TrainerConfig):
         self.dataloader = dataloader
         self.model = model
+        self.device = next(self.model.parameters()).device
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
+            weight_decay=1e-4
         )
+        self.grad_clip_max_norm = config.grad_clip_max_norm
         self.batch_size = config.batch_size
         self.max_train_steps = config.max_train_steps
         self.eva_interval = config.eva_interval
-        self.log_interval = config.log_interval
         
         #learning rate config
         self.decay_lr = config.decay_lr
@@ -59,7 +63,9 @@ class Trainer():
             # using cross entropy error loss for continue action
             self.loss_fn = lambda pred_action,target_action : F.cross_entropy(pred_action.view(-1,pred_action.size(-1)),target_action.view(-1))
         if self.game == "Hopper": 
-            #self.evaluator = Evaluator(config)
+            self.evaluator = Evaluator(config)
+            #scaling the reward
+            self.rtg_scale = 1800
             pass
         #support more games if needed
         else:
@@ -68,14 +74,17 @@ class Trainer():
         
 
     def train_step(self,step):
+        device = self.device
         optimizer = self.optimizer
-        model = self.model
+        model:Module = self.model
         lr = self.get_lr(step) if self.decay_lr else self.learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        # load data from dataloader
+        # load data from dataloader to device
         r,s,a,t,pad_mask = self.dataloader.get_batch(self.batch_size)
+        r = r / self.rtg_scale
+        r,s,a,pad_mask  = r.to(device),s.to(device),a.to(device),pad_mask.to(device) 
         # According to original paper only use pred_a for optimization
         pred_r,pred_s,pred_a = model(r,s,a,t,pad_mask)
 
@@ -84,13 +93,18 @@ class Trainer():
         optimizer.zero_grad()
         # TODO:accelerator
         loss.backward()
+        # clip the grad
+        if self.grad_clip_max_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(),self.grad_clip_max_norm)
         optimizer.step()
         return loss
-
-    def eval(self,model)->Tuple[float,float]:
+    @torch.no_grad()
+    def eval(self,model)->Tuple[float,float,float,float,float,float,]:
         #if using accelerator the model might need to be preprocessing, not sure for now 
-        mean_steps,mean_rewards =  self.evaluator.evaluate(model)
-        return mean_steps,mean_rewards
+        model.eval()
+        mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step =  self.evaluator.evaluate(model)
+        model.train()
+        return mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step
 
     def get_lr(self,step):
         """
@@ -109,7 +123,7 @@ class Trainer():
         return self.min_lr + cos_val * (self.learning_rate - self.min_lr)
     
     def train(self):
-        model = self.model
+        model:Module = self.model
         optimizer = self.optimizer
         training_loss = []
 
@@ -120,42 +134,50 @@ class Trainer():
             #TODO:logging
 
             if (step+1) % self.eva_interval == 0:
-               #TODO:logging
-               mean_train_loss = np.mean(training_loss)
-               print(f"current steps:{step}  training loss:{'{:.3f}'.format(mean_train_loss)}")
-               training_loss = []
-               print("start evaluation...")
-            #    mean_steps,mean_rewards = self.eval(model) 
-            #    print(f"evaluate result: mean steps:{'{:.3f}'.format(mean_steps)} mean rewards{'{:.3f}'.format(mean_rewards)}")
+                #TODO:logging
+                mean_train_loss = np.mean(training_loss)
+                print(f"current steps:{step} lr:{'{:.6f}'.format(self.get_lr(step))}  training loss:{'{:.3f}'.format(mean_train_loss)}")
+                training_loss = []
+                mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step = self.eval(model) 
+                print(f"current evaluate: mean_steps:{'{:.3f}'.format(mean_steps)} mean_rewards:{'{:.3f}'.format(mean_rewards)} r/step:{'{:.3f}'.format(mean_rewards/mean_steps)}  min_r:{'{:.3f}'.format(min_reward)} max_r:{'{:.3f}'.format(max_reward)} min_stp:{'{:.3f}'.format(min_step)} max_stp:{'{:.3f}'.format(max_step)}")
                
         pass
 
 class Evaluator():
     def __init__(self,config:TrainerConfig):
         self.game = config.game
+        self.num_eval_episode = config.num_eval_episode
+        self.seeds = np.random.randint(1, size=self.num_eval_episode)
         if config.game == "Hopper":
-            self.env = gym.make("Hopper-v2")
+            self.env = gym.make("Hopper-v3",render_mode=None)
             #Original code use both 3600 and 1800 now we just keep it simple
-            self.target_return = 3600
-            self.return_scale  = 1000
+            self.target_return = 3600.0
+            self.return_scale  = 1800.0
+            self.max_ep_steps = 1000
         else:
             raise NotImplementedError
-    def evaluate(self,model:model.DecisionTransformer)->Tuple[float,float]:
+    def evaluate(self,model:model.DecisionTransformer)->Tuple[float,float,float,float,float,float,]:
         """
             evaluate the model with 10 episodes and
             return the mean steps and mean reward during the games
         """
-
+        device = next(model.parameters()).device
         env:gym.Env = self.env
+        act_dim = env.action_space.sample().shape[0]
         total_steps = []
         total_rewards =[]
+        min_reward = 10000
+        max_reward = 0
+        min_step   = 10000
+        max_step   = 0
         #Evaluate 10 turns
-        for _ in range(10):
-            ini_state,info = env.reset()
-            rtg:Tensor = torch.Tensor([self.target_return])
-            states:Tensor = torch.Tensor([ini_state])
-            actions:Tensor = torch.Tensor([])
-            time_steps = [0]
+        for i in range(self.num_eval_episode):
+            ini_state,info = env.reset(seed=int(self.seeds[i]))
+            rtg:Tensor = torch.tensor([self.target_return/self.return_scale],device=device)
+            states:Tensor = torch.tensor(np.array([ini_state]),device=device,dtype=torch.float32)
+            actions:Tensor = torch.zeros((act_dim),device=device)
+            time_steps = [1]
+            
             #steps and reward for the whole episode
             ep_step = 0
             ep_reward = 0 
@@ -165,28 +187,32 @@ class Evaluator():
                     returns_to_go=rtg,
                     states=states,
                     actions=actions,
-                    time_steps=time_steps
+                    time_steps=time_steps,
                 )
-                new_state,reward,terminated =env.step(pred_act.detach().cpu().numpy())
+                observation, reward, terminated, truncated, info =env.step(pred_act.detach().cpu().numpy())
                 # rtg[t] = rtg[t-1] - rewards
-                new_rtg = rtg[-1].item() - reward/self.return_scale
-                rtg   = torch.cat((rtg,new_rtg),dim=0)
-                states = torch.cat((states,torch.tensor(new_state)),dim=0)
-                actions= torch.cat((actions,torch.tensor(pred_act)),dim=0)
-                time_steps.append(time_steps[-1]+1)
+                new_rtg = rtg[-1].item() - float(reward)/self.return_scale
+                rtg   =  torch.cat([rtg,torch.tensor([new_rtg],device=device)],dim=0)
+                states = torch.cat((states,torch.tensor(np.array([observation]),dtype=torch.float32,device=device)),dim=0)
+                actions= torch.cat((actions,pred_act),dim=0)
+                time_steps[0] += 1
 
-                ep_step +=1
-                ep_reward += reward
+                ep_step += 1
+                ep_reward += float(reward)
                 
-                if terminated:
+                if terminated or ep_step >= self.max_ep_steps:
+                    min_reward = min(min_reward,ep_reward)
+                    max_reward = max(max_reward,ep_reward)
+                    min_step   = min(min_step,ep_step)
+                    max_step   = max(max_step,ep_step)
                     break
             total_steps.append(ep_step)
             total_rewards.append(ep_reward)
         
-        mean_steps = np.mean(total_steps)
-        mean_rewards = np.mean(total_rewards)
+        mean_steps = float(np.mean(total_steps))
+        mean_rewards = float(np.mean(total_rewards))
 
-        return mean_steps,mean_rewards
+        return mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step
 
     def cleanup(self):
         self.env.close()
