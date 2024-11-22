@@ -9,6 +9,7 @@ from typing import Tuple
 import numpy as np
 import gymnasium as gym
 import model
+import wandb
 
 @dataclass
 class TrainerConfig:
@@ -131,16 +132,26 @@ class Trainer():
         for step in range(self.max_train_steps):
             loss = self.train_step(step)
             training_loss.append(loss.item())
-            #TODO:logging
 
             if (step+1) % self.eva_interval == 0:
-                #TODO:logging
                 mean_train_loss = np.mean(training_loss)
                 print(f"current steps:{step} lr:{'{:.6f}'.format(self.get_lr(step))}  training loss:{'{:.3f}'.format(mean_train_loss)}")
                 training_loss = []
                 mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step = self.eval(model) 
                 print(f"current evaluate: mean_steps:{'{:.3f}'.format(mean_steps)} mean_rewards:{'{:.3f}'.format(mean_rewards)} r/step:{'{:.3f}'.format(mean_rewards/mean_steps)}  min_r:{'{:.3f}'.format(min_reward)} max_r:{'{:.3f}'.format(max_reward)} min_stp:{'{:.3f}'.format(min_step)} max_stp:{'{:.3f}'.format(max_step)}")
-               
+
+                wandb.log(
+                    step = step,
+                    data = dict(
+                        train_loss = mean_train_loss,
+                        lr = self.get_lr(step),
+                        eval_mean_steps = mean_steps,
+                        eval_mean_return = mean_rewards,
+                        eval_steps_range = [min_step,max_step],
+                        eval_return_range = [min_reward,max_reward],
+                    )
+                )
+
         pass
 
 class Evaluator():
