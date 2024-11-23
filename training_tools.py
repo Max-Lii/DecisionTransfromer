@@ -68,6 +68,9 @@ class Trainer():
             #scaling the reward
             self.rtg_scale = 1800
             pass
+        if self.game == "HalfCheetah":
+            self.evaluator = Evaluator(config)
+            self.rtg_scale = 1000
         #support more games if needed
         else:
             raise NotImplementedError()
@@ -145,10 +148,13 @@ class Trainer():
                     data = dict(
                         train_loss = mean_train_loss,
                         lr = self.get_lr(step),
-                        eval_mean_steps = mean_steps,
-                        eval_mean_return = mean_rewards,
-                        eval_steps_range = [min_step,max_step],
-                        eval_return_range = [min_reward,max_reward],
+                        avg_eval_steps = mean_steps,
+                        avg_eval_return = mean_rewards,
+                        return_per_step = mean_rewards/mean_steps,
+                        min_eval_steps = min_step,
+                        max_eval_steps = max_step,
+                        min_eval_return = min_reward,
+                        max_eval_return = max_reward,
                     )
                 )
 
@@ -158,12 +164,17 @@ class Evaluator():
     def __init__(self,config:TrainerConfig):
         self.game = config.game
         self.num_eval_episode = config.num_eval_episode
-        self.seeds = np.random.randint(1, size=self.num_eval_episode)
+        self.seeds = np.random.randint(100000,size=self.num_eval_episode)
         if config.game == "Hopper":
             self.env = gym.make("Hopper-v3",render_mode=None)
             #Original code use both 3600 and 1800 now we just keep it simple
             self.target_return = 3600.0
             self.return_scale  = 1800.0
+            self.max_ep_steps = 1000
+        if config.game == "HalfCheetah":
+            self.env = gym.make("HalfCheetah-v3",render_mode=None)
+            self.target_return = 12000.0
+            self.return_scale  = 1000.0
             self.max_ep_steps = 1000
         else:
             raise NotImplementedError
@@ -178,7 +189,7 @@ class Evaluator():
         total_steps = []
         total_rewards =[]
         min_reward = 10000
-        max_reward = 0
+        max_reward = -10000
         min_step   = 10000
         max_step   = 0
         #Evaluate 10 turns
