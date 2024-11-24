@@ -1,6 +1,7 @@
 
 from dataclasses import dataclass
 import math
+import sys
 import torch
 from torch.nn import functional as F 
 from torch.nn import Module
@@ -9,6 +10,7 @@ from typing import Tuple
 import numpy as np
 import gymnasium as gym
 import model
+from halo import Halo
 import wandb
 
 @dataclass
@@ -74,8 +76,14 @@ class Trainer():
         #support more games if needed
         else:
             raise NotImplementedError()
-        
-        
+
+        self.spinner = Halo(text="training...",spinner="dots",stream=sys.stdout)
+    def log(self,text:str):
+        self.spinner.stop()
+
+        self.spinner.start()
+        pass
+
 
     def train_step(self,step):
         device = self.device
@@ -127,6 +135,8 @@ class Trainer():
         return self.min_lr + cos_val * (self.learning_rate - self.min_lr)
     
     def train(self):
+        
+        self.spinner.start()
         model:Module = self.model
         optimizer = self.optimizer
         training_loss = []
@@ -137,11 +147,12 @@ class Trainer():
             training_loss.append(loss.item())
 
             if (step+1) % self.eva_interval == 0:
+                self.spinner.text="evaluating..."
                 mean_train_loss = np.mean(training_loss)
-                print(f"current steps:{step} lr:{'{:.6f}'.format(self.get_lr(step))}  training loss:{'{:.3f}'.format(mean_train_loss)}")
-                training_loss = []
+                self.log(f"current steps:{step} lr:{'{:.6f}'.format(self.get_lr(step))}  training loss:{'{:.3f}'.format(mean_train_loss)}")
                 mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step = self.eval(model) 
-                print(f"current evaluate: mean_steps:{'{:.3f}'.format(mean_steps)} mean_rewards:{'{:.3f}'.format(mean_rewards)} r/step:{'{:.3f}'.format(mean_rewards/mean_steps)}  min_r:{'{:.3f}'.format(min_reward)} max_r:{'{:.3f}'.format(max_reward)} min_stp:{'{:.3f}'.format(min_step)} max_stp:{'{:.3f}'.format(max_step)}")
+                self.log(f"current evaluate: mean_steps:{'{:.3f}'.format(mean_steps)} mean_rewards:{'{:.3f}'.format(mean_rewards)} r/step:{'{:.3f}'.format(mean_rewards/mean_steps)}  min_r:{'{:.3f}'.format(min_reward)} max_r:{'{:.3f}'.format(max_reward)} min_stp:{'{:.3f}'.format(min_step)} max_stp:{'{:.3f}'.format(max_step)}")
+                training_loss = []
 
                 wandb.log(
                     step = step,
@@ -157,7 +168,8 @@ class Trainer():
                         max_eval_return = max_reward,
                     )
                 )
-
+                self.spinner.text="training..."
+        self.spinner.succeed("train finish!")
         pass
 
 class Evaluator():
@@ -171,7 +183,7 @@ class Evaluator():
             self.target_return = 3600.0
             self.return_scale  = 1800.0
             self.max_ep_steps = 1000
-        if config.game == "HalfCheetah":
+        elif config.game == "HalfCheetah":
             self.env = gym.make("HalfCheetah-v3",render_mode=None)
             self.target_return = 12000.0
             self.return_scale  = 1000.0
@@ -195,8 +207,8 @@ class Evaluator():
         #Evaluate 10 turns
         for i in range(self.num_eval_episode):
             ini_state,info = env.reset(seed=int(self.seeds[i]))
-            rtg:Tensor = torch.tensor([self.target_return/self.return_scale],device=device)
-            states:Tensor = torch.tensor(np.array([ini_state]),device=device,dtype=torch.float32)
+            rtg:Tensor     = torch.tensor([self.target_return/self.return_scale],device=device)
+            states:Tensor  = torch.tensor(np.array([ini_state]),device=device,dtype=torch.float32)
             actions:Tensor = torch.zeros((act_dim),device=device)
             time_steps = [1]
             
