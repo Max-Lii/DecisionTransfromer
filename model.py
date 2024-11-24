@@ -164,7 +164,7 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
        
         #position embedding for time steps
         assert len(time_steps) == B,f"The element numbers:{len(time_steps)} in time steps array should meet the length of bath size:{B}"
-        pos =  torch.tensor(np.array([np.arange(t) for t in time_steps]),dtype=torch.int,device=device) #torch.arange(0, time_steps, dtype=torch.long, device=device) # shape (t)
+        pos = torch.stack([torch.arange(0,t,dtype=torch.int) for t in time_steps],dim=0).to(device) # shape (t)
         pos_emb = self.pe(pos)
 
         #adding position embedding through broadcasting mechanism for better efficiency
