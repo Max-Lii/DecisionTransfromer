@@ -9,6 +9,7 @@ from torch import Tensor
 from typing import Tuple
 import numpy as np
 import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv
 import model
 from halo import Halo
 import wandb
@@ -25,6 +26,9 @@ class TrainerConfig:
     batch_size:int
     discrete_action:bool
     game:str
+    weight_decay:float = 1e-2
+    beta1:float = 0.9
+    beta2:float = 0.999
     num_eval_episode:int = 50
     grad_clip_max_norm:float|None = None
 
@@ -42,7 +46,8 @@ class Trainer():
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
-            weight_decay=1e-4
+            weight_decay=config.weight_decay,
+            betas=(config.beta1,config.beta2)
         )
         self.grad_clip_max_norm = config.grad_clip_max_norm
         self.batch_size = config.batch_size
@@ -70,7 +75,7 @@ class Trainer():
             #scaling the reward
             self.rtg_scale = 1800
             pass
-        if self.game == "HalfCheetah":
+        elif self.game == "HalfCheetah":
             self.evaluator = Evaluator(config)
             self.rtg_scale = 1000
         #support more games if needed
@@ -80,7 +85,7 @@ class Trainer():
         self.spinner = Halo(text="training...",spinner="dots",stream=sys.stdout)
     def log(self,text:str):
         self.spinner.stop()
-
+        print(text)
         self.spinner.start()
         pass
 
@@ -114,7 +119,7 @@ class Trainer():
     def eval(self,model)->Tuple[float,float,float,float,float,float,]:
         #if using accelerator the model might need to be preprocessing, not sure for now 
         model.eval()
-        mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step =  self.evaluator.evaluate(model)
+        mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step =  self.evaluator.parallelEvaluate(model)
         model.train()
         return mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step
 
@@ -154,20 +159,20 @@ class Trainer():
                 self.log(f"current evaluate: mean_steps:{'{:.3f}'.format(mean_steps)} mean_rewards:{'{:.3f}'.format(mean_rewards)} r/step:{'{:.3f}'.format(mean_rewards/mean_steps)}  min_r:{'{:.3f}'.format(min_reward)} max_r:{'{:.3f}'.format(max_reward)} min_stp:{'{:.3f}'.format(min_step)} max_stp:{'{:.3f}'.format(max_step)}")
                 training_loss = []
 
-                wandb.log(
-                    step = step,
-                    data = dict(
-                        train_loss = mean_train_loss,
-                        lr = self.get_lr(step),
-                        avg_eval_steps = mean_steps,
-                        avg_eval_return = mean_rewards,
-                        return_per_step = mean_rewards/mean_steps,
-                        min_eval_steps = min_step,
-                        max_eval_steps = max_step,
-                        min_eval_return = min_reward,
-                        max_eval_return = max_reward,
-                    )
-                )
+                # wandb.log(
+                #     step = step,
+                #     data = dict(
+                #         train_loss = mean_train_loss,
+                #         lr = self.get_lr(step),
+                #         avg_eval_steps = mean_steps,
+                #         avg_eval_return = mean_rewards,
+                #         return_per_step = mean_rewards/mean_steps,
+                #         min_eval_steps = min_step,
+                #         max_eval_steps = max_step,
+                #         min_eval_return = min_reward,
+                #         max_eval_return = max_reward,
+                #     )
+                # )
                 self.spinner.text="training..."
         self.spinner.succeed("train finish!")
         pass
@@ -179,12 +184,14 @@ class Evaluator():
         self.seeds = np.random.randint(100000,size=self.num_eval_episode)
         if config.game == "Hopper":
             self.env = gym.make("Hopper-v3",render_mode=None)
+            self.envs = AsyncVectorEnv([lambda:gym.make("Hopper-v3") for _ in range(self.num_eval_episode)])
             #Original code use both 3600 and 1800 now we just keep it simple
             self.target_return = 3600.0
             self.return_scale  = 1800.0
             self.max_ep_steps = 1000
         elif config.game == "HalfCheetah":
             self.env = gym.make("HalfCheetah-v3",render_mode=None)
+            self.envs = AsyncVectorEnv([lambda:gym.make("HalfCheetah-v3") for _ in range(self.num_eval_episode)])
             self.target_return = 12000.0
             self.return_scale  = 1000.0
             self.max_ep_steps = 1000
@@ -192,12 +199,13 @@ class Evaluator():
             raise NotImplementedError
     def evaluate(self,model:model.DecisionTransformer)->Tuple[float,float,float,float,float,float,]:
         """
-            evaluate the model with 10 episodes and
+            evaluate the model with and
             return the mean steps and mean reward during the games
         """
         device = next(model.parameters()).device
         env:gym.Env = self.env
         act_dim = env.action_space.sample().shape[0]
+        state_dim = env.observation_space.sample().shape[0]
         total_steps = []
         total_rewards =[]
         min_reward = 10000
@@ -218,11 +226,11 @@ class Evaluator():
             while True:
                 # sample the action from model
                 pred_act = model.get_action(
-                    returns_to_go=rtg,
-                    states=states,
-                    actions=actions,
+                    returns_to_go = rtg    .view(1,-1,1),
+                    states        = states .view(1,-1,state_dim),
+                    actions       = actions.view(1,-1,act_dim),
                     time_steps=time_steps,
-                )
+                )[0]
                 observation, reward, terminated, truncated, info =env.step(pred_act.detach().cpu().numpy())
                 # rtg[t] = rtg[t-1] - rewards
                 new_rtg = rtg[-1].item() - float(reward)/self.return_scale
@@ -247,6 +255,118 @@ class Evaluator():
         mean_rewards = float(np.mean(total_rewards))
 
         return mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step
+    #TODO may be we could further improve the performance by optimize the I/O
+    def parallelEvaluate(self,model)->Tuple[float,float,float,float,float,float,]:
+        device = next(model.parameters()).device
+        episode_num = self.num_eval_episode
+        batch_size = 100
 
-    def cleanup(self):
-        self.env.close()
+        # one episodes stand for one env
+        envs = self.envs
+        act_dim = envs.action_space.sample().shape[1]
+        #state_dim = envs.observation_space.sample().shape[1]
+
+        terminate_count = 0
+        ini_state,info = envs.reset(seed=self.seeds.tolist())
+
+        target_return = 1800
+        return_scale = 1000
+        ini_rtg_value = target_return / return_scale
+        current_step = 1
+
+        actions = [[np.zeros(act_dim)] for _ in range(episode_num)]
+        states  = [[ini_state[i]] for i in range(episode_num)]
+        rtgs    = [[ini_rtg_value] for _ in range(episode_num)]
+
+        episode_terminate = [False for _ in range(episode_num)]
+        episode_returns = [0 for _ in range(episode_num)]
+        episode_steps = [0 for _ in range(episode_num)]
+
+        # Loop for evaluation
+        while True:
+            ep_i = 0
+            # Loop for get a single step action for all episodes
+            while True:
+                # Get a prediction for all ongoing envs in a batch
+                batch_rtg = []
+                batch_state = []
+                batch_action = []
+                batch_ep_index =[]
+                gather_size = 0
+                # Loop for gathering ongoing episode's r,s,a,t into a batch for GPU to predict next action 
+                while True:
+                    # If the i th env is terminate we give it a radom action for alignment
+                    # and skip gathering it into the batch
+                    if episode_terminate[ep_i]:
+                        # Just give a radom action it doesn't matter since it has finished
+                        actions[ep_i].append(np.zeros(act_dim))
+                        ep_i += 1
+                        if ep_i >= episode_num:
+                            break
+                        continue
+
+                    # If i th env is still on going, gathering it into the batch
+                    batch_rtg.append(rtgs[ep_i])
+                    batch_state.append(states[ep_i])
+                    batch_action.append(actions[ep_i])
+                    batch_ep_index.append(ep_i)
+                    gather_size +=1
+                    ep_i+=1
+
+                    # Gather until we meet the batch size or the maximum size of episodes
+                    if ep_i >= episode_num or gather_size >= batch_size:
+                        break
+                # Send the batch to model to get the predict actions
+                batch_time   = [current_step for _ in range(len(batch_rtg))] 
+                batch_rtg    = torch.from_numpy(np.array(batch_rtg)).unsqueeze(-1).float().to(device)
+                batch_state  = torch.from_numpy(np.array(batch_state)).float().to(device)
+                batch_action = torch.from_numpy(np.array(batch_action)).float().to(device)
+
+                pred_acts = model.get_action(
+                    returns_to_go=batch_rtg,
+                    states=batch_state,
+                    actions=batch_action,
+                    time_steps=batch_time,
+                ).detach().cpu().numpy()
+
+                #Loop for store the predict action to the corresponding actions
+                for batch_index,env_index in enumerate(batch_ep_index):
+                    actions[env_index].append(pred_acts[batch_index])
+                
+                # finish getting the action for all episodes
+                if ep_i >= episode_num:
+                    break
+            
+            # Make a step for all episodes (envs) 
+            step_actions = [ action[-1] for action in actions ]
+            observations, rewards, terminates, _, _ = envs.step(step_actions)
+
+            
+            for i in range(episode_num):
+                states[i].append(observations[i])
+
+                if episode_terminate[i]:
+                    continue
+                
+                # If episode got terminate set the terminate flag to true
+                if terminates[i]:
+                    terminate_count += 1
+                    episode_terminate[i] = True
+
+                rtgs[i].append(rtgs[i][-1] + rewards[i] / return_scale)
+                episode_returns[i] += rewards[i]
+                episode_steps[i] += 1
+              
+            current_step += 1
+            # if all episodes are terminated finish the evaluation
+            if terminate_count >= episode_num or current_step > self.max_ep_steps:
+                break
+            
+        mean_steps = float(np.mean(episode_steps))
+        mean_rewards = float(np.mean(episode_returns))
+        min_reward = float(np.min(episode_returns))
+        max_reward = float(np.max(episode_returns))
+        min_step = float(np.min(episode_steps))
+        max_step = float(np.max(episode_steps))
+
+        return mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step

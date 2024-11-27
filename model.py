@@ -210,11 +210,10 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
     @torch.inference_mode()
     def get_action(self,returns_to_go, states, actions, time_steps,max_length=None):
         #turn input into batches-like input
-        states = states.view(1, -1, self.state_dim)
-        actions = actions.view(1, -1, self.act_dim)
-        returns_to_go = returns_to_go.view(1, -1, 1)
+        # states = states.view(1, -1, self.state_dim)
+        # actions = actions.view(1, -1, self.act_dim)
+        # returns_to_go = returns_to_go.view(1, -1, 1)
         
-        att_msk = None
         #TODO:if need max_length clip the context
         # if max_length is not None:
         #     states = states[:,-self.max_length:]
@@ -224,7 +223,7 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         states = states[:,-self.context_size:]
         actions = actions[:,-self.context_size:]
         returns_to_go = returns_to_go[:,-self.context_size:]
-        time_steps[0] =  min(time_steps[0],self.context_size)
+        time_steps = [ min(time_step,self.context_size)  for time_step in time_steps]
         
         rtg_pred, state_pred, act_pred = self.forward(
             states=states,
@@ -232,5 +231,4 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
             returns_to_go=returns_to_go,
             time_steps=time_steps,
         )
-
-        return act_pred[0,-1]
+        return act_pred[:,-1]
