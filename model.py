@@ -209,17 +209,7 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
     
     @torch.inference_mode()
     def get_action(self,returns_to_go, states, actions, time_steps,max_length=None):
-        #turn input into batches-like input
-        # states = states.view(1, -1, self.state_dim)
-        # actions = actions.view(1, -1, self.act_dim)
-        # returns_to_go = returns_to_go.view(1, -1, 1)
-        
-        #TODO:if need max_length clip the context
-        # if max_length is not None:
-        #     states = states[:,-self.max_length:]
-        #     actions = actions[:,-self.max_length:]
-        #     returns_to_go = returns_to_go[:,-self.max_length:]
-        #     time_steps = time_steps[:,-self.max_length:]
+                
         states = states[:,-self.context_size:]
         actions = actions[:,-self.context_size:]
         returns_to_go = returns_to_go[:,-self.context_size:]
