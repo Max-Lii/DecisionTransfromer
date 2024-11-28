@@ -108,7 +108,7 @@ class Trainer():
         # Because pred_a is predict from current s as the next action (1 token behind) which can't see the real action
         loss = self.loss_fn(pred_a,a)
         optimizer.zero_grad()
-        # TODO:accelerator
+        # TODO:accelerate
         loss.backward()
         # clip the grad
         if self.grad_clip_max_norm is not None:
@@ -159,20 +159,20 @@ class Trainer():
                 self.log(f"current evaluate: mean_steps:{'{:.3f}'.format(mean_steps)} mean_rewards:{'{:.3f}'.format(mean_rewards)} r/step:{'{:.3f}'.format(mean_rewards/mean_steps)}  min_r:{'{:.3f}'.format(min_reward)} max_r:{'{:.3f}'.format(max_reward)} min_stp:{'{:.3f}'.format(min_step)} max_stp:{'{:.3f}'.format(max_step)}")
                 training_loss = []
 
-                # wandb.log(
-                #     step = step,
-                #     data = dict(
-                #         train_loss = mean_train_loss,
-                #         lr = self.get_lr(step),
-                #         avg_eval_steps = mean_steps,
-                #         avg_eval_return = mean_rewards,
-                #         return_per_step = mean_rewards/mean_steps,
-                #         min_eval_steps = min_step,
-                #         max_eval_steps = max_step,
-                #         min_eval_return = min_reward,
-                #         max_eval_return = max_reward,
-                #     )
-                # )
+                wandb.log(
+                    step = step,
+                    data = dict(
+                        train_loss = mean_train_loss,
+                        lr = self.get_lr(step),
+                        avg_eval_steps = mean_steps,
+                        avg_eval_return = mean_rewards,
+                        return_per_step = mean_rewards/mean_steps,
+                        min_eval_steps = min_step,
+                        max_eval_steps = max_step,
+                        min_eval_return = min_reward,
+                        max_eval_return = max_reward,
+                    )
+                )
                 self.spinner.text="training..."
         self.spinner.succeed("train finish!")
         pass
@@ -255,10 +255,10 @@ class Evaluator():
         mean_rewards = float(np.mean(total_rewards))
 
         return mean_steps,mean_rewards,min_reward,max_reward,min_step,max_step
-    #TODO may be we could further improve the performance by optimize the I/O
+
     def parallelEvaluate(self,model)->Tuple[float,float,float,float,float,float,]:
         device = next(model.parameters()).device
-        episode_num = self.num_eval_episode
+        num_episode = self.num_eval_episode
         batch_size = 100
 
         # one episodes stand for one env
@@ -274,13 +274,13 @@ class Evaluator():
         ini_rtg_value = target_return / return_scale
         current_step = 1
 
-        actions = [[np.zeros(act_dim)] for _ in range(episode_num)]
-        states  = [[ini_state[i]] for i in range(episode_num)]
-        rtgs    = [[ini_rtg_value] for _ in range(episode_num)]
+        actions = [[np.zeros(act_dim)] for _ in range(num_episode)]
+        states  = [[ini_state[i]] for i in range(num_episode)]
+        rtgs    = [[ini_rtg_value] for _ in range(num_episode)]
 
-        episode_terminate = [False for _ in range(episode_num)]
-        episode_returns = [0 for _ in range(episode_num)]
-        episode_steps = [0 for _ in range(episode_num)]
+        episode_terminate = [False for _ in range(num_episode)]
+        episode_returns = [0 for _ in range(num_episode)]
+        episode_steps = [0 for _ in range(num_episode)]
 
         # Loop for evaluation
         while True:
@@ -301,7 +301,7 @@ class Evaluator():
                         # Just give a radom action it doesn't matter since it has finished
                         actions[ep_i].append(np.zeros(act_dim))
                         ep_i += 1
-                        if ep_i >= episode_num:
+                        if ep_i >= num_episode:
                             break
                         continue
 
@@ -314,7 +314,7 @@ class Evaluator():
                     ep_i+=1
 
                     # Gather until we meet the batch size or the maximum size of episodes
-                    if ep_i >= episode_num or gather_size >= batch_size:
+                    if ep_i >= num_episode or gather_size >= batch_size:
                         break
                 # Send the batch to model to get the predict actions
                 batch_time   = [current_step for _ in range(len(batch_rtg))] 
@@ -334,7 +334,7 @@ class Evaluator():
                     actions[env_index].append(pred_acts[batch_index])
                 
                 # finish getting the action for all episodes
-                if ep_i >= episode_num:
+                if ep_i >= num_episode:
                     break
             
             # Make a step for all episodes (envs) 
@@ -342,7 +342,7 @@ class Evaluator():
             observations, rewards, terminates, _, _ = envs.step(step_actions)
 
             
-            for i in range(episode_num):
+            for i in range(num_episode):
                 states[i].append(observations[i])
 
                 if episode_terminate[i]:
@@ -359,7 +359,7 @@ class Evaluator():
               
             current_step += 1
             # if all episodes are terminated finish the evaluation
-            if terminate_count >= episode_num or current_step > self.max_ep_steps:
+            if terminate_count >= num_episode or current_step > self.max_ep_steps:
                 break
             
         mean_steps = float(np.mean(episode_steps))
