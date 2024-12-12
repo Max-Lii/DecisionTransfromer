@@ -19,6 +19,7 @@ class ModelConfig():
     dropout:float
     vocab_size:int
     context_size:int
+    ep_len:int
     dt_bias:bool = True
     gpt_bias:bool = False
     action_tanh:bool = False
@@ -39,13 +40,13 @@ class CasualAttention(nn.Module):
 
     def forward(self,x:Tensor):
         #batch size, token length, embedding dimension(n_embd)
-        B,T,C = x.size();
+        B,T,C = x.size()
         q: torch.Tensor
         #mapping to input to query,key,value, split it at the last dim
-        q,k,v = self.qkv_linear(x).split(self.n_embd,2);
-        q = q.view(B,T,C // self.n_head, self.n_head).transpose(1,2); # (B,T,C)->(B,T,C_h,h)->(B,C_h,T,h)
-        k = k.view(B,T,C // self.n_head, self.n_head).transpose(1,2); # (B,T,C)->(B,T,C_h,h)->(B,C_h,T,h)
-        v = v.view(B,T,C // self.n_head, self.n_head).transpose(1,2); # (B,T,C)->(B,T,C_h,h)->(B,C_h,T,h)
+        q, k, v = self.qkv_linear(x).split(C, dim=-1)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2); # (B,T,C)->(B,T,h,C_h)->(B,h,T,C_h)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1,2); # (B,T,C)->(B,T,h,C_h)->(B,h,T,C_h)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2); # (B,T,C)->(B,T,h,C_h)->(B,h,T,C_h)
 
         # using the flash attention automatically if possible
         # this function could not turn dropout off when in eval mode so we handle it ourselves
@@ -57,7 +58,7 @@ class CasualAttention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0 ,
             is_causal=True)
         # re-assemble all head outputs side by side
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)# (B,C_h,T,h) ->(B,T,C)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)# (B,h,T,C_h) ->(B,T,C)
         out = self.resid_dropout(self.concat_linear(attn_out))
         return out
     
@@ -70,7 +71,7 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
     def forward(self,x):
         x = self.linear_1(x)
-        x = self.self.gelu(x)
+        x = self.gelu(x)
         x = self.linear_2(x)
         x = self.dropout(x)
         return x
@@ -135,7 +136,7 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         self.register_buffer("states_std",torch.from_numpy(config.state_std).view(1,1,self.state_dim))
 
         #embedding for position(time step), state, actions, returns-to-go
-        self.pe = nn.Embedding(config.context_size,self.n_embd)
+        self.pe = nn.Embedding(config.ep_len + config.context_size,self.n_embd) # extra time step embedding for padding 
         self.se = nn.Linear(config.state_dim,self.n_embd,bias=config.dt_bias)
         self.ae = nn.Linear(config.act_dim,self.n_embd,bias=config.dt_bias) 
         self.re = nn.Linear(1,self.n_embd,bias=config.dt_bias)
@@ -147,6 +148,7 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         )
         self.pred_state = nn.Linear(self.n_embd,config.state_dim,bias=config.dt_bias)
         self.pred_rtg= nn.Linear(self.n_embd,1,bias=config.dt_bias)
+        self.embed_ln = nn.LayerNorm(self.n_embd)
 
         self.gpt = GPT(config)
     def forward(self,returns_to_go:Tensor, states:Tensor, actions:Tensor, time_steps, pad_mask = None)->Tuple[Tensor,Tensor,Tensor]:
@@ -163,8 +165,8 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
 
        
         #position embedding for time steps
-        assert len(time_steps) == B,f"The element numbers:{len(time_steps)} in time steps array should meet the length of bath size:{B}"
-        pos = torch.stack([torch.arange(0,t,dtype=torch.int) for t in time_steps],dim=0).to(device) # shape (t)
+        # assert len(time_steps) == B,f"The element numbers:{len(time_steps)} in time steps array should meet the length of bath size:{B}"
+        pos = torch.stack([torch.arange(max(t-self.context_size,0),t,dtype=torch.int) for t in time_steps],dim=0).to(device) # shape (t))
         pos_emb = self.pe(pos)
 
         #adding position embedding through broadcasting mechanism for better efficiency
@@ -172,6 +174,7 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         
         traj = torch.stack((rtg_emb,state_emb,act_emb),dim=2) + pos_emb.unsqueeze(2) # (3,B,T,C) -> (B,T,3,C)
         traj = traj.view(B,3*T,C) # (B,3T,C): each time steps have 3 tokens
+        traj = self.embed_ln(traj)
         # Notice: The official code do a layer norm here,
         # however, GPT using the pre-norm, which means token will apply layer norm before every blocks
         # so we don't have to use the layer norm here
@@ -213,7 +216,7 @@ class DecisionTransformer(nn.Module,PyTorchModelHubMixin):
         states = states[:,-self.context_size:]
         actions = actions[:,-self.context_size:]
         returns_to_go = returns_to_go[:,-self.context_size:]
-        time_steps = [ min(time_step,self.context_size)  for time_step in time_steps]
+        # time_steps = [ min(time_step,self.context_size)  for time_step in time_steps]
         
         rtg_pred, state_pred, act_pred = self.forward(
             states=states,
