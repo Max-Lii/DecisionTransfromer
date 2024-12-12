@@ -51,7 +51,7 @@ class D4RLDatasets():
             r.append(np.concatenate([episode["returns_to_go"][ep_start : ep_start+self.sample_length],np.zeros(pad_length)]))
             s.append(np.concatenate([episode["observations"] [ep_start : ep_start+self.sample_length],np.zeros((pad_length,self.s_dim))]))
             a.append(np.concatenate([episode["actions"]      [ep_start : ep_start+self.sample_length],np.zeros((pad_length,self.a_dim))]))
-            t.append(self.sample_length)
+            t.append(ep_start+self.sample_length)
             pad_mask.append(np.concatenate([np.ones(self.sample_length - pad_length),np.zeros(pad_length)]))
 
         #convert all r,s,a to tensor (B,T,C)
