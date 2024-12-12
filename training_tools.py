@@ -66,7 +66,7 @@ class Trainer():
         
         if not config.discrete_action:
             # using mean square error loss for continue action
-            self.loss_fn = lambda pred_action,target_action : torch.mean((pred_action - target_action)**2) 
+            self.loss_fn = lambda pred_action,target_action : F.mse_loss(pred_action,target_action)#torch.mean((pred_action - target_action)**2) 
         else:
             # using cross entropy error loss for continue action
             self.loss_fn = lambda pred_action,target_action : F.cross_entropy(pred_action.view(-1,pred_action.size(-1)),target_action.view(-1))
@@ -106,7 +106,8 @@ class Trainer():
         pred_r,pred_s,pred_a = model(r,s,a,t,pad_mask)
 
         # Because pred_a is predict from current s as the next action (1 token behind) which can't see the real action
-        loss = self.loss_fn(pred_a,a)
+        loss = self.loss_fn(pred_a,a.detach())
+        loss = (loss * pad_mask.unsqueeze(-1)).mean()
         optimizer.zero_grad()
         # TODO:accelerate
         loss.backward()
@@ -259,7 +260,7 @@ class Evaluator():
     def parallelEvaluate(self,model)->Tuple[float,float,float,float,float,float,]:
         device = next(model.parameters()).device
         num_episode = self.num_eval_episode
-        batch_size = 100
+        batch_size = 64
 
         # one episodes stand for one env
         envs = self.envs
@@ -269,12 +270,12 @@ class Evaluator():
         terminate_count = 0
         ini_state,info = envs.reset(seed=self.seeds.tolist())
 
-        target_return = 1800
-        return_scale = 1000
+        target_return = self.target_return
+        return_scale = self.return_scale
         ini_rtg_value = target_return / return_scale
         current_step = 1
 
-        actions = [[np.zeros(act_dim)] for _ in range(num_episode)]
+        actions = [[np.zeros(act_dim)] for _ in range(num_episode)] #[[] for _ in range(num_episode)]#
         states  = [[ini_state[i]] for i in range(num_episode)]
         rtgs    = [[ini_rtg_value] for _ in range(num_episode)]
 
@@ -317,6 +318,8 @@ class Evaluator():
                     if ep_i >= num_episode or gather_size >= batch_size:
                         break
                 # Send the batch to model to get the predict actions
+                # print(f"{batch_action[0]=}")
+
                 batch_time   = [current_step for _ in range(len(batch_rtg))] 
                 batch_rtg    = torch.from_numpy(np.array(batch_rtg)).unsqueeze(-1).float().to(device)
                 batch_state  = torch.from_numpy(np.array(batch_state)).float().to(device)
@@ -331,15 +334,18 @@ class Evaluator():
 
                 #Loop for store the predict action to the corresponding actions
                 for batch_index,env_index in enumerate(batch_ep_index):
-                    actions[env_index].append(pred_acts[batch_index])
+                    actions[env_index].insert(-1,pred_acts[batch_index])
+                    # actions[env_index].append(pred_acts[batch_index])
                 
                 # finish getting the action for all episodes
                 if ep_i >= num_episode:
                     break
             
             # Make a step for all episodes (envs) 
-            step_actions = [ action[-1] for action in actions ]
+            step_actions = [ action[-2] for action in actions ]
+            # print(step_actions)
             observations, rewards, terminates, _, _ = envs.step(step_actions)
+            # print(rewards)
 
             
             for i in range(num_episode):
@@ -353,7 +359,7 @@ class Evaluator():
                     terminate_count += 1
                     episode_terminate[i] = True
 
-                rtgs[i].append(rtgs[i][-1] + rewards[i] / return_scale)
+                rtgs[i].append(rtgs[i][-1] - (rewards[i] / return_scale))
                 episode_returns[i] += rewards[i]
                 episode_steps[i] += 1
               
